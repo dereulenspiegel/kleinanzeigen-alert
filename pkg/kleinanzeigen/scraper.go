@@ -1,39 +1,46 @@
-package scraper
+package kleinanzeigen
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog/log"
-
-	"github.com/gocolly/colly"
+	"github.com/gocolly/colly/v2"
 )
 
-const url = "https://www.ebay-kleinanzeigen.de/seite:%v/s-%s/k0l%vr%v"
+const url = "https://www.kleinanzeigen.de/seite:%v/s-%s/k0l%vr%v"
 
-const cityURL = "https://www.ebay-kleinanzeigen.de/s-ort-empfehlungen.json?query=%s"
+const cityURL = "https://www.kleinanzeigen.de/s-ort-empfehlungen.json?query=%s"
 
-// Ad is a representation of the kleinanzeigen ads
-type Ad struct {
-	Title    string
-	Link     string
-	Price    string
-	Location string
-	ID       string
+type Querier struct {
+	log *slog.Logger
+}
+
+func NewQuerier(log *slog.Logger) *Querier {
+	return &Querier{log}
+}
+
+func (q *Querier) QueryAds(query *Query) ([]*Ad, error) {
+	cityCode, _, err := findCityID(q.log, query.cityName)
+	if err != nil {
+		return nil, fmt.Errorf("failed query city code for city %s: %w", query.cityName, err)
+	}
+	ads := getAds(q.log, 0, query.term, cityCode, query.radius, &query.maxPrice, &query.minPrice)
+	return ads, nil
 }
 
 // GetAds gets the ads for the specified page serachterm citycode and radius
-func GetAds(page int, term string, cityCode int, radius int, maxPrice *int, minPrice *int) []Ad {
-	log.Debug().Msg("scraping for ads")
+func getAds(log *slog.Logger, page int, term string, cityCode int, radius int, maxPrice *float64, minPrice *float64) []*Ad {
+	log.Debug("scraping for ads")
 	query := fmt.Sprintf(url, page, strings.ReplaceAll(term, " ", "-"), cityCode, radius)
-	ads := make([]Ad, 0, 0)
+	ads := make([]*Ad, 0)
 	c := colly.NewCollector(
 		colly.UserAgent("telegram-alert-bot/1.0"),
 	)
@@ -48,7 +55,12 @@ func GetAds(page int, term string, cityCode int, radius int, maxPrice *int, minP
 				space := regexp.MustCompile(`\s+`)
 				location := strings.TrimSpace(e.DOM.Find("div [class=aditem-main--top--left]").Last().Text())
 
+				imageUrl := e.ChildAttr("div.aditem-image > a > div > img", "src")
+				description := e.ChildText("div.aditem-main > div.aditem-main--middle > p")
+
 				location = space.ReplaceAllString(location, " ")
+				var priceValue float64
+				var err error
 
 				if maxPrice != nil && strings.ToLower(price) != "zu verschenken" {
 					replacted := strings.Trim(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.Trim(price, " "), "VB", ""), "€", ""), ".", ""), " ")
@@ -57,20 +69,20 @@ func GetAds(page int, term string, cityCode int, radius int, maxPrice *int, minP
 						return
 					}
 
-					priceValue, err := strconv.Atoi(replacted)
+					priceValue, err = strconv.ParseFloat(replacted, 64)
 
 					if err != nil {
-						log.Warn().Str("price-string", replacted).Msg("could not parse price from ad")
+						log.Warn("could not parse price from ad", "price-string", replacted)
 						return
 					}
 
 					if priceValue >= *maxPrice {
-						log.Debug().Msg("price is bigger than requested")
+						log.Debug("price is bigger than requested")
 						return
 					}
 
 					if minPrice != nil && priceValue < *minPrice {
-						log.Debug().Msg("price is lower than requested")
+						log.Debug("price is lower than requested")
 						return
 					}
 				}
@@ -79,27 +91,35 @@ func GetAds(page int, term string, cityCode int, radius int, maxPrice *int, minP
 				//details := e.DOM.Find("div[class=aditem-details]")
 				title := link.Text()
 				if idExsits {
-					ads = append(ads, Ad{Title: title, Link: "https://www.ebay-kleinanzeigen.de" + linkURL, ID: id, Price: price, Location: location})
+					ads = append(ads, &Ad{
+						title:       title,
+						link:        "https://www.kleinanzeigen.de" + linkURL,
+						id:          id,
+						price:       priceValue,
+						location:    &location,
+						imageUrl:    imageUrl,
+						description: description,
+					})
 				}
 			}
 		})
 	})
 	c.OnError(func(r *colly.Response, e error) {
-		log.Error().Err(e).Str("term", term).Int("radius", radius).Msg("error while scraping for ads")
+		log.Error("error while scraping for ads", "err", e, "term", term, "radius", radius)
 	})
 
 	c.Visit(query)
 
 	c.Wait()
 
-	log.Debug().Str("query", term).Int("number_of_queries", len(ads)).Msg("scraped ads for query")
+	log.Debug("scraped ads for query", "query", term, "number_of_queries", len(ads))
 
 	return ads
 }
 
 // FindCityID finds the city by the name/postal code
-func FindCityID(untrimmed string) (int, string, error) {
-	log.Debug().Str("city_search_term", untrimmed).Msg("finding city id")
+func findCityID(log *slog.Logger, untrimmed string) (int, string, error) {
+	log.Debug("finding city id", "city_search_term", untrimmed)
 
 	city := strings.Trim(untrimmed, " ")
 
@@ -110,7 +130,7 @@ func FindCityID(untrimmed string) (int, string, error) {
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf(cityURL, city), nil)
 
 	if err != nil {
-		log.Error().Err(err).Msg("could not create the request")
+		log.Error("could not create the request", "err", err)
 		return 0, "", errors.New("could not make request")
 	}
 
@@ -125,9 +145,9 @@ func FindCityID(untrimmed string) (int, string, error) {
 	}
 
 	if res.StatusCode != 200 {
-		log.Error().Str("status_code", res.Status).Msg("received a wrong status code.")
+		log.Error("received a wrong status code.", "status_code", res.Status)
 		if res.StatusCode == 403 {
-			log.Error().Msg("ip address might be blocked by kleinanzeigen.")
+			log.Error("ip address might be blocked by kleinanzeigen.")
 		}
 		return 0, "", errors.New("request for city not successful")
 	}
@@ -159,7 +179,7 @@ func FindCityID(untrimmed string) (int, string, error) {
 			return 0, "", errors.New("could not get cityId")
 		}
 
-		log.Debug().Int("city_id", cityID).Str("city_name", value).Msg("found city")
+		log.Debug("found city", "city_id", cityID, "city_name", value)
 
 		return cityID, value, nil
 	}
